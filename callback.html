@@ -87,11 +87,23 @@
 // Firebase Realtime Database URL
 const FB_URL = 'https://moneytime-app-f5a15-default-rtdb.firebaseio.com';
 
+// דף זה מתארח בנפרד מהאפליקציה (ריפו ציבורי moneytime-static) — אין index.html
+// לחזור אליו שם. הצמדה ל-index.html רלוונטית רק בפיתוח מקומי (npx serve .).
+var STANDALONE = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+
+// המקורות היחידים שמותר להם לקבל את הטוקן ב-postMessage: ה-PWA בפרודקשן, והמקור של
+// הדף עצמו (בפיתוח מקומי האפליקציה וה-callback חולקים את אותו localhost).
+// יעד '*' היה מוסר את הטוקן לכל דף שפתח את החלון הזה.
+var ALLOWED_OPENERS = ['https://moneytime.pages.dev'];
+if(ALLOWED_OPENERS.indexOf(window.location.origin) === -1) ALLOWED_OPENERS.push(window.location.origin);
+
 // חילוץ token ו-state מה-URL
 var hash = window.location.hash || window.location.search;
 var params = new URLSearchParams(hash.replace(/^[#?]/, ''));
 var token = params.get('access_token');
-var state = params.get('state') || 'anon';
+// state חובה: בלעדיו הטוקן היה נכתב לצומת משותף וקריא לכל (oauthTokens/anon),
+// והאפליקציה ממילא דוחה טוקן שה-state שלו לא תואם לזה שהיא שמרה.
+var state = params.get('state') || '';
 
 function updateStatus(msg){
   document.getElementById('status').textContent = msg;
@@ -104,28 +116,49 @@ function showSuccess(){
   document.getElementById('subtitle').textContent = 'חוזר לאפליקציה...';
 }
 
-if(token){
-  updateStatus('שומר את פרטי ההתחברות...');
-  
-  // 1. שמירה ב-localStorage (עבור PWA במקרה של redirect מלא)
+var hasOpener = !!(window.opener && !window.opener.closed);
+
+if(token && state && hasOpener){
+  // PWA popup: הטוקן עובר רק לחלון האב, ורק אם הוא אחד המקורות המותרים
+  // (postMessage ליעד שלא תואם פשוט לא נמסר). לא נכתב ל-Firebase ולא ל-deep link —
+  // אין שם מי שיאסוף אותו, והוא היה נשאר חשוף.
   try{
-    localStorage.setItem('gtoken', token);
-    localStorage.setItem('syen', '1');
-    localStorage.setItem('oauth_done', '1');
-    updateStatus('✓ נשמר ב-localStorage');
+    ALLOWED_OPENERS.forEach(function(origin){
+      window.opener.postMessage({ type: 'oauth_token', token: token, state: state }, origin);
+    });
+    updateStatus('✓ נשלח לאפליקציה');
+    showSuccess();
+    setTimeout(function(){ window.close(); }, 1500);
   }catch(e){
-    updateStatus('⚠ שגיאה ב-localStorage: ' + e.message);
+    updateStatus('⚠ שגיאה בהעברה לאפליקציה: ' + e.message);
   }
-  
-  // 2. שמירה ב-Firebase (עבור APK polling)
+
+} else if(token && state){
+  updateStatus('שומר את פרטי ההתחברות...');
+
+  // 1. localStorage — רק בפיתוח מקומי, שם האפליקציה באותו מקור וקוראת אותו אחרי
+  // ה-redirect. בפרודקשן הדף הזה על מקור אחר (github.io), האפליקציה לא יכולה לקרוא
+  // משם, והטוקן היה נשאר שמור שם לתמיד.
+  if(!STANDALONE){
+    try{
+      localStorage.setItem('gtoken', token);
+      localStorage.setItem('syen', '1');
+      localStorage.setItem('oauth_done', '1');
+    }catch(e){
+      updateStatus('⚠ שגיאה ב-localStorage: ' + e.message);
+    }
+  }
+
+  // 2. שמירה ב-Firebase (עבור APK polling). האפליקציה מוחקת את הצומת מיד כשהיא אוספת.
   var safeState = state.replace(/[.#$\[\]\/]/g, '_');
   fetch(FB_URL + '/oauthTokens/' + safeState + '.json', {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       token: token,
+      state: state,
       ts: Date.now(),
-      // Token יימחק אוטומטית אחרי 10 דקות (אבטחה)
+      // האפליקציה דוחה טוקן שעבר את התוקף הזה
       expires: Date.now() + 600000
     })
   }).then(function(){
@@ -133,9 +166,11 @@ if(token){
   }).catch(function(e){
     updateStatus('⚠ שגיאה ב-Firebase: ' + e.message);
   });
-  
-  // 3. ניסיון deep link ל-APK (אם זה Capacitor)
-  var deepLink = 'com.tzur669.moneytime://oauth#access_token=' + token;
+
+  // 3. deep link ל-APK (גיבוי ל-polling). ה-state מצורף כדי שהאפליקציה תאמת שזה
+  // הטוקן של הזרימה שהיא פתחה, ולא קישור שמישהו אחר שלח.
+  var deepLink = 'com.tzur669.moneytime://oauth#access_token=' + encodeURIComponent(token)
+    + '&state=' + encodeURIComponent(state);
   setTimeout(function(){
     try{
       window.location.href = deepLink;
@@ -144,53 +179,26 @@ if(token){
       // deep link נכשל - זה בסדר, זה אומר שאנחנו לא ב-APK
     }
   }, 500);
-  
-  // 4. postMessage לחלון אב (PWA popup)
-  if(window.opener && !window.opener.closed){
-    try{
-      window.opener.postMessage({
-        type: 'oauth_token',
-        token: token,
-        state: state
-      }, '*'); // יעבוד גם ב-localhost וגם ב-production
-      updateStatus('✓ נשלח ל-popup opener');
-      
-      // הצלחה! סגור חלון
-      showSuccess();
-      setTimeout(function(){
-        window.close();
-      }, 1500);
-    }catch(e){
-      updateStatus('⚠ שגיאה ב-postMessage: ' + e.message);
-      // אם postMessage נכשל, נסה redirect
-      fallbackRedirect();
-    }
-  } else {
-    // אין חלון אב - כנראה redirect מלא
-    updateStatus('אין popup opener - redirect מלא');
-    fallbackRedirect();
-  }
-  
+
+  fallbackRedirect();
+
 } else {
-  // אין token - שגיאה או ביטול
+  // אין token או state - שגיאה או ביטול
   document.getElementById('title').textContent = 'ההתחברות נכשלה';
   document.getElementById('subtitle').textContent = 'לא התקבל access token';
   document.getElementById('spinner').style.display = 'none';
-  updateStatus('⚠ נסה שוב או בדוק הרשאות');
-  
+  updateStatus('⚠ יש לנסות שוב או לבדוק הרשאות');
+
   setTimeout(function(){
     if(window.opener && !window.opener.closed){
       window.close();
-    } else {
+    } else if(!STANDALONE){
       window.location.href = 'index.html';
     }
   }, 3000);
 }
 
 // fallback - חזרה לדף הראשי
-// דף זה מתארח בנפרד מהאפליקציה (ריפו ציבורי moneytime-static) — אין index.html
-// לחזור אליו שם. הצמדה ל-index.html רלוונטית רק בפיתוח מקומי (npx serve .).
-var STANDALONE = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
 function fallbackRedirect(){
   showSuccess();
   if(STANDALONE){
